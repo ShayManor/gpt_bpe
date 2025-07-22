@@ -682,6 +682,8 @@ type TextsTokenizer struct {
 	Unitrim          bool
 	ExcludeTokens    []string
 	SanitizeEncoding bool
+	Sentinel         string
+	SentinelTokens   gpt_bpe.Tokens
 }
 
 // NewTextsTokenizer
@@ -698,6 +700,8 @@ func NewTextsTokenizer() TextsTokenizer {
 		true,
 		[]string{},
 		false,
+		"",
+		nil,
 	}
 }
 
@@ -729,6 +733,14 @@ func getAndCheckToken(
 	}
 }
 
+// getTokenSeq
+// Gets multiple tokens for sentinel
+func getTokenSeq(t *gpt_bpe.GPTEncoder, s string) gpt_bpe.Tokens {
+	s = strings.ReplaceAll(s, "\\n", "\n")
+	toks := *t.Encode(&s)
+	return toks
+}
+
 func (tt *TextsTokenizer) InitTokenizer() (*gpt_bpe.GPTEncoder, error) {
 	var encoderPtr *gpt_bpe.GPTEncoder
 	var tokErr error
@@ -751,6 +763,11 @@ func (tt *TextsTokenizer) InitTokenizer() (*gpt_bpe.GPTEncoder, error) {
 	if tt.SanitizeEncoding {
 		// Table is found in sanitizer.go
 		encoderPtr.SpecialsTree.InsertReplacementsIntoRuneTree(encodingTable)
+	}
+
+	// Set SentinelTokens
+	if tt.Sentinel != "" && tt.SentinelTokens == nil {
+		tt.SentinelTokens = getTokenSeq(encoderPtr, tt.Sentinel)
 	}
 
 	return encoderPtr, nil
@@ -961,6 +978,35 @@ func (tt TextsTokenizer) TokenizeTexts(
 	return tokenizedTexts, &tokenizerStatus, nil
 }
 
+// findSubslice
+// Efficiently finds subsequence of sentinel tokens
+func findSubslice(hay, needle gpt_bpe.Tokens) int {
+	if len(needle) == 0 {
+		return -1
+	}
+	for i := 0; i+len(needle) <= len(hay); i++ {
+		match := true
+		for j := range needle {
+			if hay[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+type Span struct {
+	Path            string `json:"path"`
+	PromptStart     int    `json:"prompt_start"`
+	SentinelStart   int    `json:"sentinel_start"`
+	CompletionStart int    `json:"completion_start"`
+	End             int    `json:"end"`
+}
+
 // TokenizeTextsToContexts
 // Consumes a TextsIterator and produces a ContextsIterator iterator function
 // that returns tokenized contexts that are fixed and padded out to
@@ -1108,9 +1154,17 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 				status.PartitionerState = "done"
 				return nil
 			} else if done && idx == numTokens {
+				if len(tt.SentinelTokens) > 0 {
+					searchSpace := tokens[begin:idx]
+					if pos := findSubslice(searchSpace, tt.SentinelTokens); pos >= 0 {
+						// cut at the sentinel
+						idx = begin + pos
+					}
+				}
+
 				// We're completely done and have no more token chunks to
 				// return, so we flush out and pad the last chunk.
-				chunk := tokens[begin:]
+				chunk := tokens[begin:idx]
 				padSize := contextSize - len(chunk)
 				if padSize > 0 {
 					for padIdx := 0; padIdx < padSize; padIdx += 1 {
@@ -1139,7 +1193,18 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 				currWindow := idx - begin
 				if currWindow >= contextSize {
 					status.PartitionerState = "chunking"
-					chunk := (tokens)[begin:]
+
+					// Find sentinel when applicable
+					if len(tt.SentinelTokens) > 0 {
+						searchSpace := tokens[begin:idx]
+						if pos := findSubslice(searchSpace, tt.SentinelTokens); pos >= 0 {
+							abs := begin + pos
+							// treat sentinel like a boundary hit
+							boundaryIdxes = append(boundaryIdxes, abs)
+						}
+					}
+
+					chunk := (tokens)[begin:idx]
 
 					if doUnitrim {
 						var endAt int
@@ -1154,15 +1219,6 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 						idx = begin + len(chunk)
 					}
 
-					// If we have less than `contextSize`, we need to pad out
-					// the tokens in this context.
-					padSize := contextSize - len(chunk)
-					if padSize > 0 {
-						for padIdx := 0; padIdx < padSize; padIdx += 1 {
-							chunk = append(chunk, padToken)
-						}
-						status.PadTokens += padSize
-					}
 					// We had one or more boundary tokens in our last context,
 					// so depending on the BoundaryOverlap, use the last
 					// boundary or the boundary closest to the BounderOverlap
@@ -1176,11 +1232,20 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 					if boundary == 0xFFFFFFFF && doUnitrim {
 						// Ensure that our next chunk is aligned to valid
 						// unicode.
+						nextChunk := tokens[begin:idx]
 						_, offset := tokenizer.AlignAndSizeTokens(
-							&chunk,
-							idx-begin,
-						)
+							&nextChunk, idx-begin)
 						idx = begin + offset
+					}
+					chunk = tokens[begin:idx]
+
+					// If we have less than `contextSize`, we need to pad out
+					// the tokens in this context.
+					if pad := contextSize - len(chunk); pad > 0 {
+						for i := 0; i < pad; i++ {
+							chunk = append(chunk, padToken)
+						}
+						status.PadTokens += pad
 					}
 
 					boundaryIdxes = boundaryIdxes[:0]
@@ -1702,6 +1767,11 @@ func main() {
 		"output tokens as uint32 instead of uint16 (required for "+
 			"vocabs with over 2^16 tokens)",
 	)
+	sentinel := flag.String(
+		"sentinel",
+		"Empty",
+		"Sentinel token for prompt masking. An empty string means using next-token masking",
+	)
 
 	flag.Parse()
 	if *inputDir == "" {
@@ -1722,6 +1792,7 @@ func main() {
 	log.Printf("Tokenizer input source: %s\n", *inputDir)
 	log.Printf("Tokenizer output: %s\n", *outputFile)
 	log.Printf("Tokenizer reordering method: %s\n", *reorderPaths)
+	log.Printf("Sentinel: %s\n", *sentinel)
 	log.Printf(
 		"Sampling amount (in %s tokens kept): %d%s\n",
 		"%", sampling, "%",
@@ -1755,6 +1826,7 @@ func main() {
 	textsTokenizer.Unitrim = !*unitrimBool
 	textsTokenizer.ExcludeTokens = excludeTokensList
 	textsTokenizer.SanitizeEncoding = !*sanitizeEncodingBool
+	textsTokenizer.Sentinel = *sentinel // SentinelTokens set later
 
 	if !*forceRetokenization {
 		if outStat, outErr := os.Stat(*outputFile); !errors.Is(
@@ -1924,7 +1996,7 @@ func main() {
 				)
 				indexFilePath := strings.ReplaceAll(outputFilePath, ".tokens", ".index")
 				contexts, status, tokErr = textsTokenizer.TokenizeTextsToContexts(
-					textReaders, encoder, contexts, &wg,
+					textReaders, encoder, nil, nil,
 				)
 				if tokErr != nil {
 					log.Fatal(tokErr)
