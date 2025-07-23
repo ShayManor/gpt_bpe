@@ -548,6 +548,7 @@ func ReadTexts(
 	sanitize bool,
 	sortSpec string,
 	numReaderThreads int,
+	sentinel string,
 ) (chan namedRuneReader, error) {
 	matches, err := GlobTexts(dirPath)
 	// If we have a single file and it's not a directory, then we want to
@@ -633,18 +634,38 @@ func ReadTexts(
 						}
 					} else {
 						fileName := removeDirPath(path.Path)
-						if sanitize {
-							runeReaders <- namedRuneReader{
-								fileName,
-								CreateTextSanitizer(fileReader)}
+						if sentinel != "" {
+							fileContent, err := os.ReadFile(path.Path)
+							if err != nil {
+								log.Fatal(err)
+							}
+
+							if sanitize {
+								runeReaders <- namedRuneReader{
+									fileName,
+									CreateTextSanitizer(strings.NewReader(string(fileContent))),
+								}
+							} else {
+								runeReaders <- namedRuneReader{
+									fileName,
+									strings.NewReader(string(fileContent)),
+								}
+							}
 						} else {
-							bufferedReader := bufio.NewReaderSize(
-								fileReader, 8*1024*1024,
-							)
-							bufferedReader.Peek(1024 * 1024)
-							runeReaders <- namedRuneReader{
-								fileName,
-								bufferedReader}
+							// Original streaming logic for non-instruction-tuning
+							if sanitize {
+								runeReaders <- namedRuneReader{
+									fileName,
+									CreateTextSanitizer(fileReader)}
+							} else {
+								bufferedReader := bufio.NewReaderSize(
+									fileReader, 8*1024*1024,
+								)
+								bufferedReader.Peek(1024 * 1024)
+								runeReaders <- namedRuneReader{
+									fileName,
+									bufferedReader}
+							}
 						}
 					}
 				}
@@ -1098,7 +1119,11 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 				status.WaitTime += time.Since(waitBegin)
 				encodeChunk := tokenizer.StreamingEncode(runeReader.reader)
 				for {
-					tokenized := encodeChunk(contextSize * 4)
+					chunkSize := contextSize * 4
+					if tt.Sentinel != "" {
+						chunkSize = contextSize * 100
+					}
+					tokenized := encodeChunk(chunkSize)
 					if tokenized == nil {
 						duration := time.Since(beginTs)
 						tokenizedTexts <- gpt_bpe.Tokens{endOfText}
@@ -1779,6 +1804,11 @@ func main() {
 		log.Fatal("Must provide -input for directory source")
 	}
 
+	if *sentinel != "" {
+		*boundaryToken = ""
+		*boundaryOverlap = 0
+	}
+
 	sampling, err := strconv.Atoi(*sampling_str)
 	if err != nil {
 		log.Fatal("Sampling parameter must be an integer")
@@ -1922,7 +1952,7 @@ func main() {
 		}
 	} else {
 		textReaders, err = ReadTexts(
-			*inputDir, *sanitizeBool, *reorderPaths, *numReaderThreads,
+			*inputDir, *sanitizeBool, *reorderPaths, *numReaderThreads, *sentinel,
 		)
 
 		if err != nil {
