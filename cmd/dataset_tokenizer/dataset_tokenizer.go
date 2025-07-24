@@ -684,6 +684,7 @@ type TextsTokenizer struct {
 	SanitizeEncoding bool
 	Sentinel         string
 	SentinelTokens   gpt_bpe.Tokens
+	SanitizeSentinel bool
 }
 
 // NewTextsTokenizer
@@ -702,6 +703,7 @@ func NewTextsTokenizer() TextsTokenizer {
 		false,
 		"",
 		nil,
+		false,
 	}
 }
 
@@ -733,11 +735,44 @@ func getAndCheckToken(
 	}
 }
 
+func isWhitespaceToken(t *gpt_bpe.GPTEncoder, id gpt_bpe.Token) bool {
+	dec := string(t.Decoder[id])
+	trimmed := strings.Trim(dec, " \t\r\n")
+	if trimmed == "" {
+		return true
+	}
+	// SentencePiece / BPE-leading-space markers
+	if strings.HasPrefix(dec, "▁") || strings.HasPrefix(dec, "Ġ") {
+		// treat pure marker or marker + pure ASCII WS as whitespace
+		if strings.Trim(dec[3:], " \t\r\n") == "" { // "▁" is 3 bytes in UTF-8
+			return true
+		}
+	}
+	return false
+}
+
 // getTokenSeq
-// Gets multiple tokens for sentinel
-func getTokenSeq(t *gpt_bpe.GPTEncoder, s string) gpt_bpe.Tokens {
+// Gets token sequence of sentinel token normalized for whitespace. Required to find sentinel.
+func getTokenSeq(t *gpt_bpe.GPTEncoder, s string, stripWhitespace bool) gpt_bpe.Tokens {
 	s = strings.ReplaceAll(s, "\\n", "\n")
 	toks := *t.Encode(&s)
+
+	if !stripWhitespace {
+		return toks
+	}
+
+	// strip BOS/EOS
+	if len(toks) > 0 && toks[0] == t.BosToken {
+		toks = toks[1:]
+	}
+	if l := len(toks); l > 0 && toks[l-1] == t.EosToken {
+		toks = toks[:l-1]
+	}
+
+	// strip ALL leading whitespace-ish tokens, including SP markers
+	for len(toks) > 0 && isWhitespaceToken(t, toks[0]) {
+		toks = toks[1:]
+	}
 	return toks
 }
 
@@ -767,7 +802,13 @@ func (tt *TextsTokenizer) InitTokenizer() (*gpt_bpe.GPTEncoder, error) {
 
 	// Set SentinelTokens
 	if tt.Sentinel != "" && tt.SentinelTokens == nil {
-		tt.SentinelTokens = getTokenSeq(encoderPtr, tt.Sentinel)
+		tt.SentinelTokens = getTokenSeq(encoderPtr, tt.Sentinel, tt.SanitizeSentinel)
+		dec := encoderPtr.Decode(&tt.SentinelTokens)
+		log.Printf("Sentinel IDs: %v  Decoded: %q", tt.SentinelTokens, dec)
+
+		if strings.TrimSpace(dec) != tt.Sentinel {
+			log.Printf("warning: decoded sentinel %q != flag %q (ignoring leading WS)", dec, tt.Sentinel)
+		}
 	}
 
 	return encoderPtr, nil
@@ -1139,32 +1180,26 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 	// Return an iterator function that returns token chunks that are always
 	// `contextSize` tokens.
 	nextContext := func() *gpt_bpe.Tokens {
-		if len(tokens)-idx < contextSize*4 {
+		if len(tokens)-idx < contextSize*4 && !done {
 			status.PartitionerState = "waiting"
 			moreTokens()
 			status.PartitionerState = "got_tokens"
 		}
+
 		// Loop until we get a full token chunk.
 		for {
 			numTokens := len(tokens)
 			status.AccumulatorSize = numTokens
 			status.ChunkerIndex = idx
 			status.PartitionerState = "looping"
+
 			if numTokens == 0 {
 				status.PartitionerState = "done"
 				return nil
 			} else if done && idx == numTokens {
-				if len(tt.SentinelTokens) > 0 {
-					searchSpace := tokens[begin:idx]
-					if pos := findSubslice(searchSpace, tt.SentinelTokens); pos >= 0 {
-						// cut at the sentinel
-						idx = begin + pos
-					}
-				}
-
 				// We're completely done and have no more token chunks to
 				// return, so we flush out and pad the last chunk.
-				chunk := tokens[begin:idx]
+				chunk := tokens[begin:]
 				padSize := contextSize - len(chunk)
 				if padSize > 0 {
 					for padIdx := 0; padIdx < padSize; padIdx += 1 {
@@ -1178,69 +1213,139 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 				status.PartitionerState = "done"
 				return &chunk
 			}
-			// Iterate until we reach the end of this text's tokens.
-			for idx < numTokens {
-				status.PartitionerState = "iterating"
-				status.ChunkerIndex = idx
-				token := (tokens)[idx]
-				// If this is a 'boundary' token, add it to our list.
-				status.PartitionerState = "boundary"
-				if token == boundary {
-					boundaryIdxes = append(boundaryIdxes, idx)
+
+			// Branch based on whether we're using sentinel tokens or not
+			if len(tt.SentinelTokens) == 0 {
+				// PRETRAIN MODE: Original logic when no sentinel
+				// Iterate until we reach the end of this text's tokens.
+				for idx < numTokens {
+					status.PartitionerState = "iterating"
+					status.ChunkerIndex = idx
+					token := (tokens)[idx]
+					// If this is a 'boundary' token, add it to our list.
+					status.PartitionerState = "boundary"
+					if token == boundary {
+						boundaryIdxes = append(boundaryIdxes, idx)
+					}
+					// Determine if we're at least `contextSize` yet, and if so
+					// we do the finalization of this context.
+					currWindow := idx - begin
+					if currWindow >= contextSize {
+						status.PartitionerState = "chunking"
+						chunk := (tokens)[begin:]
+
+						if doUnitrim {
+							var endAt int
+							chunk, endAt = aligner.AlignAndSizeTokens(
+								&chunk,
+								contextSize,
+							)
+							idx = begin + endAt
+						} else if len(chunk) > contextSize {
+							chunk = chunk[:contextSize]
+							idx = begin + contextSize
+						} else {
+							idx = begin + len(chunk)
+						}
+
+						// If we have less than `contextSize`, we need to pad out
+						// the tokens in this context.
+						padSize := contextSize - len(chunk)
+						if padSize > 0 {
+							for padIdx := 0; padIdx < padSize; padIdx += 1 {
+								chunk = append(chunk, padToken)
+							}
+							status.PadTokens += padSize
+						}
+						// We had one or more boundary tokens in our last context,
+						// so depending on the BoundaryOverlap, use the last
+						// boundary or the boundary closest to the BounderOverlap
+						// index. This effectively copies the chunk from that point
+						// on into the next returned context.
+						idx = tt.PartitionBoundary(&boundaryIdxes, begin, idx)
+
+						// We were given a hard index to use as the chunk boundary,
+						// and it may not be a complete unicode character, so we
+						// need to align it to a valid unicode character.
+						if boundary == 0xFFFFFFFF && doUnitrim {
+							// Ensure that our next chunk is aligned to valid
+							// unicode.
+							_, offset := tokenizer.AlignAndSizeTokens(
+								&chunk,
+								idx-begin,
+							)
+							idx = begin + offset
+						}
+
+						boundaryIdxes = boundaryIdxes[:0]
+
+						// Reset the `begin` offsets, move idx, to set up the
+						// state for the next invocation of this function.
+						if idx > contextSize*6 {
+							tokens = tokens[idx:]
+							begin = 0
+							idx = 0
+						} else {
+							begin = idx
+						}
+						numTokens = len(tokens)
+						return &chunk
+					}
+					idx += 1
+					status.AccumulatorSize = numTokens
+					status.ChunkerIndex = idx
+					if len(tokens)-idx < contextSize*2 {
+						status.PartitionerState = "fetching"
+						moreTokens()
+						numTokens = len(tokens)
+						status.PartitionerState = "got_tokens"
+					}
 				}
-				// Determine if we're at least `contextSize` yet, and if so
-				// we do the finalization of this context.
-				currWindow := idx - begin
-				if currWindow >= contextSize {
+			} else {
+				// SENTINEL MODE: New logic for sentinel-based chunking
+				// Check if we have enough tokens for a context
+				if idx-begin >= contextSize || (done && idx > begin) {
 					status.PartitionerState = "chunking"
 
-					// Find sentinel when applicable
-					if len(tt.SentinelTokens) > 0 {
-						searchSpace := tokens[begin:idx]
-						if pos := findSubslice(searchSpace, tt.SentinelTokens); pos >= 0 {
-							abs := begin + pos
-							// treat sentinel like a boundary hit
-							boundaryIdxes = append(boundaryIdxes, abs)
+					// Default to current position
+					chunkEnd := idx
+
+					// Find sentinel if applicable
+					searchEnd := idx
+					if searchEnd > begin+contextSize {
+						searchEnd = begin + contextSize
+					}
+					searchSpace := tokens[begin:searchEnd]
+					if sentinelPos := findSubslice(searchSpace, tt.SentinelTokens); sentinelPos >= 0 {
+						// Cut after the sentinel
+						sentinelEnd := begin + sentinelPos + len(tt.SentinelTokens)
+						if sentinelEnd <= begin+contextSize {
+							chunkEnd = sentinelEnd
 						}
 					}
 
-					chunk := (tokens)[begin:idx]
+					// If no sentinel found or it doesn't fit, check boundaries
+					if chunkEnd == idx && len(boundaryIdxes) > 0 {
+						chunkEnd = tt.PartitionBoundary(&boundaryIdxes, begin, idx)
+					}
 
-					if doUnitrim {
+					// Apply unitrim if needed
+					if doUnitrim && chunkEnd > begin {
+						chunk := tokens[begin:chunkEnd]
 						var endAt int
-						chunk, endAt = aligner.AlignAndSizeTokens(
-							&chunk,
-							contextSize,
-						)
-						idx = begin + endAt
-					} else if len(chunk) > contextSize {
-						chunk = (tokens)[:contextSize]
-					} else {
-						idx = begin + len(chunk)
+						chunk, endAt = aligner.AlignAndSizeTokens(&chunk, contextSize)
+						chunkEnd = begin + endAt
 					}
 
-					// We had one or more boundary tokens in our last context,
-					// so depending on the BoundaryOverlap, use the last
-					// boundary or the boundary closest to the BounderOverlap
-					// index. This effectively copies the chunk from that point
-					// on into the next returned context.
-					idx = tt.PartitionBoundary(&boundaryIdxes, begin, idx)
-
-					// We were given a hard index to use as the chunk boundary,
-					// and it may not be a complete unicode character, so we
-					// need to align it to a valid unicode character.
-					if boundary == 0xFFFFFFFF && doUnitrim {
-						// Ensure that our next chunk is aligned to valid
-						// unicode.
-						nextChunk := tokens[begin:idx]
-						_, offset := tokenizer.AlignAndSizeTokens(
-							&nextChunk, idx-begin)
-						idx = begin + offset
+					// Ensure we don't exceed context size
+					if chunkEnd-begin > contextSize {
+						chunkEnd = begin + contextSize
 					}
-					chunk = tokens[begin:idx]
 
-					// If we have less than `contextSize`, we need to pad out
-					// the tokens in this context.
+					// Extract the chunk
+					chunk := tokens[begin:chunkEnd]
+
+					// Pad if necessary
 					if pad := contextSize - len(chunk); pad > 0 {
 						for i := 0; i < pad; i++ {
 							chunk = append(chunk, padToken)
@@ -1248,27 +1353,89 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 						status.PadTokens += pad
 					}
 
-					boundaryIdxes = boundaryIdxes[:0]
-
-					// Reset the `begin` offsets, move idx, to set up the
-					// state for the next invocation of this function.
-					if idx > contextSize*6 {
-						tokens = tokens[idx:]
-						begin = 0
-						idx = 0
+					// Update state for next chunk
+					begin = chunkEnd
+					if begin >= numTokens && done {
+						idx = numTokens
 					} else {
-						begin = idx
+						idx = chunkEnd
 					}
-					numTokens = len(tokens)
+
+					// Clear boundary indexes that are now behind us
+					newBoundaryIdxes := make([]int, 0)
+					for _, bIdx := range boundaryIdxes {
+						if bIdx >= begin {
+							newBoundaryIdxes = append(newBoundaryIdxes, bIdx)
+						}
+					}
+					boundaryIdxes = newBoundaryIdxes
+
+					// Compact token buffer if it's getting too large
+					if begin > contextSize*6 && begin > 0 {
+						tokens = tokens[begin:]
+						idx -= begin
+
+						// Adjust boundary indexes
+						for i := range boundaryIdxes {
+							boundaryIdxes[i] -= begin
+						}
+
+						begin = 0
+					}
+
 					return &chunk
 				}
-				idx += 1
-				status.AccumulatorSize = numTokens
-				status.ChunkerIndex = idx
-				if len(tokens)-idx < contextSize*2 {
-					status.PartitionerState = "fetching"
-					moreTokens()
-					status.PartitionerState = "got_tokens"
+
+				// Need more tokens, advance through the current buffer
+				for idx < numTokens && idx-begin < contextSize {
+					token := tokens[idx]
+
+					// Track boundaries
+					if token == boundary {
+						boundaryIdxes = append(boundaryIdxes, idx)
+					}
+
+					idx++
+
+					// Check if we should fetch more tokens
+					if !done && numTokens-idx < contextSize*2 {
+						status.PartitionerState = "fetching"
+						moreTokens()
+						numTokens = len(tokens)
+						status.PartitionerState = "got_tokens"
+					}
+				}
+
+				// Handle final chunk for sentinel mode when done
+				if done && idx >= numTokens && begin < numTokens {
+					// Process any remaining tokens as final chunk
+					finalIdx := numTokens
+
+					// Check for sentinel in final chunk
+					searchSpace := tokens[begin:finalIdx]
+					if pos := findSubslice(searchSpace, tt.SentinelTokens); pos >= 0 {
+						// Include the sentinel in the final chunk
+						sentinelEnd := begin + pos + len(tt.SentinelTokens)
+						if sentinelEnd <= numTokens {
+							finalIdx = sentinelEnd
+						}
+					}
+
+					chunk := tokens[begin:finalIdx]
+					padSize := contextSize - len(chunk)
+					if padSize > 0 {
+						for padIdx := 0; padIdx < padSize; padIdx++ {
+							chunk = append(chunk, padToken)
+						}
+						status.PadTokens += padSize
+					}
+
+					// Clear for next iteration
+					tokens = tokens[:0]
+					idx = 0
+					begin = 0
+					status.PartitionerState = "done"
+					return &chunk
 				}
 			}
 		}
@@ -1320,6 +1487,7 @@ func WriteContexts(
 	shuffle bool,
 	enforceUint32 bool,
 	showContexts bool,
+	sentinel gpt_bpe.Tokens,
 ) (int, error) {
 	totalTokens := 0
 	useUint32 := enforceUint32
@@ -1403,6 +1571,7 @@ func WriteContexts(
 	var contextSize int
 	var target int64
 	var prevTarget int64
+	foundAny := false
 
 	// Sometimes it is requested that we shuffle all contexts as they are
 	// written to the file. This is useful for training data, as it can help
@@ -1418,6 +1587,9 @@ func WriteContexts(
 	idxes := make([]paddingTuple, 0)
 	idxFormat := "{\"offset\": %d, \"tokens\": %d}\n"
 	for context := range sampledContexts {
+		if len(sentinel) > 0 && findSubslice(context, sentinel) >= 0 {
+			foundAny = true
+		}
 		binContext, err := context.ToBin(useUint32)
 		if err != nil {
 			return totalTokens, err
@@ -1506,6 +1678,10 @@ func WriteContexts(
 
 		totalTokens += len(context)
 		endpos += len(*binContext)
+	}
+
+	if len(sentinel) > 0 && !foundAny {
+		log.Printf("Warning: no context contained sentinel %v", sentinel)
 	}
 
 	// TODO: This is unnecessary, as golang has a Truncate method
@@ -1769,8 +1945,13 @@ func main() {
 	)
 	sentinel := flag.String(
 		"sentinel",
-		"Empty",
-		"Sentinel token for prompt masking. An empty string means using next-token masking",
+		"",
+		"sentinel token for prompt masking. An empty string means using next-token masking",
+	)
+	sanitizeSentinel := flag.Bool(
+		"sanitize_sentinel",
+		true,
+		"strip leading whitespace from sentinel tokens (new behavior)",
 	)
 
 	flag.Parse()
@@ -1793,6 +1974,7 @@ func main() {
 	log.Printf("Tokenizer output: %s\n", *outputFile)
 	log.Printf("Tokenizer reordering method: %s\n", *reorderPaths)
 	log.Printf("Sentinel: %s\n", *sentinel)
+	log.Printf("Sanitize sentinel %t\n", *sanitizeSentinel)
 	log.Printf(
 		"Sampling amount (in %s tokens kept): %d%s\n",
 		"%", sampling, "%",
@@ -1827,6 +2009,7 @@ func main() {
 	textsTokenizer.ExcludeTokens = excludeTokensList
 	textsTokenizer.SanitizeEncoding = !*sanitizeEncodingBool
 	textsTokenizer.Sentinel = *sentinel // SentinelTokens set later
+	textsTokenizer.SanitizeSentinel = *sanitizeSentinel
 
 	if !*forceRetokenization {
 		if outStat, outErr := os.Stat(*outputFile); !errors.Is(
@@ -1869,6 +2052,10 @@ func main() {
 	encoder, tokErr := textsTokenizer.InitTokenizer()
 	if tokErr != nil {
 		log.Fatal(tokErr)
+	}
+	if len(textsTokenizer.SentinelTokens) > 0 {
+		dec := encoder.Decode(&textsTokenizer.SentinelTokens)
+		log.Printf("Sentinel IDs: %v  Decoded: %q", textsTokenizer.SentinelTokens, dec)
 	}
 
 	hasS3Prefix, s3Bucket, s3FilePath := removeS3Prefix(*inputDir)
@@ -1968,6 +2155,7 @@ func main() {
 					false,
 					*enforceUint32,
 					*showContexts,
+					textsTokenizer.SentinelTokens,
 				)
 				if writeErr != nil {
 					log.Fatal(writeErr)
@@ -2015,6 +2203,7 @@ func main() {
 					*reorderPaths == "shuffle",
 					*enforceUint32,
 					*showContexts,
+					textsTokenizer.SentinelTokens,
 				)
 				if writeErr != nil {
 					log.Fatal(writeErr)
