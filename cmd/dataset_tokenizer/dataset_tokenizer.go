@@ -805,6 +805,9 @@ func (tt *TextsTokenizer) InitTokenizer() (*gpt_bpe.GPTEncoder, error) {
 		tt.SentinelTokens = getTokenSeq(encoderPtr, tt.Sentinel, tt.SanitizeSentinel)
 		dec := encoderPtr.Decode(&tt.SentinelTokens)
 		log.Printf("Sentinel IDs: %v  Decoded: %q", tt.SentinelTokens, dec)
+		if len(tt.SentinelTokens) > 1 {
+			tt.SentinelTokens = tt.SentinelTokens[1:]
+		}
 
 		if strings.TrimSpace(dec) != tt.Sentinel {
 			log.Printf("warning: decoded sentinel %q != flag %q (ignoring leading WS)", dec, tt.Sentinel)
@@ -1038,14 +1041,6 @@ func findSubslice(hay, needle gpt_bpe.Tokens) int {
 		}
 	}
 	return -1
-}
-
-type Span struct {
-	Path            string `json:"path"`
-	PromptStart     int    `json:"prompt_start"`
-	SentinelStart   int    `json:"sentinel_start"`
-	CompletionStart int    `json:"completion_start"`
-	End             int    `json:"end"`
 }
 
 // TokenizeTextsToContexts
@@ -1302,7 +1297,7 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 					}
 				}
 			} else {
-				// SENTINEL MODE: New logic for sentinel-based chunking
+				// SENTINEL MODE
 				// Check if we have enough tokens for a context
 				if idx-begin >= contextSize || (done && idx > begin) {
 					status.PartitionerState = "chunking"
@@ -1746,7 +1741,7 @@ func WriteContexts(
 			return totalTokens, err
 		}
 	}
-
+	defer outFile.Close()
 	return totalTokens, nil
 }
 
@@ -2183,9 +2178,17 @@ func main() {
 					*outputFile, threadId,
 				)
 				indexFilePath := strings.ReplaceAll(outputFilePath, ".tokens", ".index")
-				contexts, status, tokErr = textsTokenizer.TokenizeTextsToContexts(
-					textReaders, encoder, nil, nil,
-				)
+				if textsTokenizer.Sentinel != "" {
+					// Not needed for sentinel case
+					contexts, status, tokErr = textsTokenizer.TokenizeTextsToContexts(
+						textReaders, encoder, nil, nil,
+					)
+				} else {
+					contexts, status, tokErr = textsTokenizer.TokenizeTextsToContexts(
+						textReaders, encoder, contexts, &wg,
+					)
+				}
+
 				if tokErr != nil {
 					log.Fatal(tokErr)
 				}
