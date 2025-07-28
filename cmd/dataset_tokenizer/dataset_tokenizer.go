@@ -1340,12 +1340,13 @@ func (tt TextsTokenizer) TokenizeTextsToContexts(
 					// Extract the chunk
 					chunk := tokens[begin:chunkEnd]
 
-					// Pad if necessary
-					if pad := contextSize - len(chunk); pad > 0 {
-						for i := 0; i < pad; i++ {
+					// If we have less than `contextSize`, we need to pad out
+					// the tokens in this context.
+					if padSize := contextSize - len(chunk); padSize > 0 {
+						for i := 0; i < padSize; i++ {
 							chunk = append(chunk, padToken)
 						}
-						status.PadTokens += pad
+						status.PadTokens += padSize
 					}
 
 					// Update state for next chunk
