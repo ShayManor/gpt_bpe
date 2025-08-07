@@ -4,7 +4,7 @@ on:
   workflow_run:
     workflows: ['Test Commands']
     types: ['completed']
-    branches: ['main']
+    branches: ['main', 'smanor/sentinel-support']
 
 jobs:
   publish:
